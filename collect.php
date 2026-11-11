@@ -1,53 +1,41 @@
 <?php
-declare(strict_types=1);
-require _DIR_ . '/config.php';
-
-// Simple API authentication (update this key!)
-$apiKey = 'your-secret-key-123'; 
-$receivedKey = $_SERVER['HTTP_X_API_KEY'] ?? '';
-if ($receivedKey !== $apiKey) {
-    http_response_code(403);
-    exit('Invalid API key');
-}
-
+// 3.3.2 Traffic collection and alert detection backend
+// Network devices POST: key, device_id, bytes_in, bytes_out, bandwidth_pct   (every 5 seconds)
+require __DIR__ . '/db.php';
+require __DIR__ . '/functions.php';
+header('Content-Type: text/plain');
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); exit('POST only'); }
+if (!hash_equals(COLLECT_KEY, (string)($_POST['key'] ?? ''))) { http_response_code(403); exit('bad key'); }
+$dev = (int)($_POST['device_id'] ?? 0);
+$in  = max(0, (int)($_POST['bytes_in'] ?? 0));
+$out = max(0, (int)($_POST['bytes_out'] ?? 0));
+$pct = (float)($_POST['bandwidth_pct'] ?? 0);
+$pct = min(100, max(0, $pct));
+$now = date('Y-m-d H:i:s');
+// the device must be registered
+$chk = $pdo->prepare('SELECT device_id FROM devices WHERE device_id = ?');
+$chk->execute([$dev]);
+if (!$chk->fetch()) { http_response_code(404); exit('unknown device'); }
+// reject duplicate reading for same device and time
+$chk = $pdo->prepare('SELECT log_id FROM traffic_logs WHERE device_id = ? AND logged_at = ?');
+$chk->execute([$dev, $now]);
+if ($chk->fetch()) { exit('duplicate'); }
 try {
-    $deviceId = (int)($_POST['device_id'] ?? 0);
-    $bytesIn = (int)($_POST['bytes_in'] ?? 0);
-    $bytesOut = (int)($_POST['bytes_out'] ?? 0);
-    $bandwidthPct = (float)($_POST['bandwidth_pct'] ?? 0);
-    $loggedAt = $_POST['logged_at'] ?? date('Y-m-d H:i:s');
-
-    if ($deviceId <=0 || $bytesIn <0 || $bytesOut <0 || $bandwidthPct <0 || $bandwidthPct >100) {
-        throw new RuntimeException('Invalid data values');
-    }
-
-    $pdo = db();
-
-    // Insert traffic reading
-    $stmt = $pdo->prepare("INSERT INTO traffic_logs (device_id, bytes_in, bytes_out, bandwidth_pct, logged_at) VALUES (?, ?, ?, ?, ?)");
-    $stmt->execute([$deviceId, $bytesIn, $bytesOut, $bandwidthPct, $loggedAt]);
-    $logId = $pdo->lastInsertId();
-
-    // Update device status to online
-    $pdo->prepare("UPDATE devices SET status='online', last_seen=? WHERE device_id=?", )->execute([$loggedAt, $deviceId]);
-
-    // Check for bandwidth alert
-    $threshold = (int)setting_value($pdo, 'bandwidth_threshold', '80');
-    if ($bandwidthPct >= $threshold) {
-        // Avoid duplicate alerts for same reading
-        $check = $pdo->prepare("SELECT alert_id FROM alerts WHERE device_id=? AND log_id=? AND is_resolved=0");
-        $check->execute([$deviceId, $logId]);
-        if (!$check->fetch()) {
-            $severity = $bandwidthPct >=90 ? 'High' : 'Medium';
-            $pdo->prepare("INSERT INTO alerts (device_id, log_id, alert_type, severity, created_at) VALUES (?, ?, ?, ?, ?)")
-                ->execute([$deviceId, $logId, 'High bandwidth utilization', $severity, $loggedAt]);
-        }
-    }
-
-    http_response_code(200);
-    echo 'OK: Reading saved';
-} catch (Throwable $ex) {
-    http_response_code(500);
-    echo 'Error: ' . $ex->getMessage();
+    $ins = $pdo->prepare('INSERT INTO traffic_logs (device_id, bytes_in, bytes_out, bandwidth_pct, logged_at) VALUES (?,?,?,?,?)');
+    $ins->execute([$dev, $in, $out, $pct, $now]);
+} catch (PDOException $e) {
+    exit('duplicate');   // the UNIQUE key (device_id, logged_at) caught a race between two requests
 }
-?>
+$logId = $pdo->lastInsertId();
+// the device is clearly alive
+$pdo->prepare("UPDATE devices SET status = 'online', last_seen = ? WHERE device_id = ?")->execute([$now, $dev]);
+// compare with the threshold
+$threshold = (float)setting($pdo, 'bandwidth_threshold', 80);
+if ($pct >= $threshold) {
+    $sev = ($pct >= 90) ? 'High' : 'Medium';
+    $a = $pdo->prepare("INSERT INTO alerts (device_id, log_id, alert_type, severity, created_at) VALUES (?, ?, 'Traffic spike', ?, ?)");
+    $a->execute([$dev, $logId, $sev, $now]);
+}
+// separate check: flag any device that has stopped reporting
+check_offline($pdo);
+echo 'ok';
